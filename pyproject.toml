@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "dsprites-mechinterp"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+transformers = "^4.41.2"
+datasets = "^2.20.0"
+torch = "^2.3.1"
+numpy = "^2.0.0"
+matplotlib = "^3.9.0"
+vit-prisma = "^0.1.4"
+plotly = "5.19.0"
+wandb = "^0.17.3"
+clip = {git = "https://github.com/openai/CLIP.git"}
+ftfy = "^6.2.0"
+regex = "^2024.5.15"
+tqdm = "^4.66.4"
+
+
+[tool.poetry.group.dev.dependencies]
+jupyter = "^1.0.0"
+black = "^24.4.2"
+isort = "^5.13.2"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
