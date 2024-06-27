@@ -13,6 +13,26 @@ from torchvision.transforms import Resize, Compose, ToTensor, Normalize
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
+from vit_prisma.prisma_tools.logit_lens import get_patch_logit_directions
+from typing import Optional
+import pandas as pd
+
+
+def patch_forward(patch):
+    patch = torch.sigmoid(patch)
+    return patch
+
+
+# Apply the adversarial_patch to the image
+def apply_patch(image: torch.Tensor, patch: torch.Tensor):
+    """
+    :param image: torch.Tensor: Image tensor
+    :param patch: torch.Tensor: Patch tensor (1, 3, 32, 32)
+    """
+    patch_size = patch.size(-1)
+    image = image.clone()
+    image[:, :, :patch_size, :patch_size] = patch_forward(patch)
+    return image
 
 
 class CLIPLens(object):
@@ -42,6 +62,7 @@ class CLIPLens(object):
                 ),
             ]
         )
+        self.transform = self.base_transform
 
     def compute_text_cache(
         self,
@@ -72,19 +93,28 @@ class CLIPLens(object):
         logits = self.logit_scale * post_proj_cls_token @ self.text_features.T
         return logits
 
-    def compute_image_cache(self, image: Image.Image):
+    def compute_image_cache(
+        self, image: Image.Image, patch: Optional[torch.Tensor] = None
+    ):
         assert self.text_features is not None, "Text cache not computed."
         self.image = image.convert("RGB")
         self.image_tensor = self.transform(self.image).unsqueeze(0)
+
+        # Show image patched with a random patch:
+        if patch is not None:
+            self.image_tensor = apply_patch(self.image_tensor, patch)
+
         self.image_tensor_unnormalized = self.base_transform(image)
         self.post_proj_cls_token, self.cache = self.model.run_with_cache(
             self.image_tensor
         )
         self.image_features = self.post_proj_cls_token
-        self.logits: torch.Tensor = self.logit_scale * self.image_features @ self.text_features.T
+        self.logits: torch.Tensor = (
+            self.logit_scale * self.image_features @ self.text_features.T
+        )
         self.probs = self.logits.softmax(dim=-1).cpu().detach()
 
-    def print_preds(self, print_idx: list[int] = [], top_k=10):
+    def print_preds(self, print_idx: list[int] = [], top_k=10, layer_idx: int = -1):
         """
         Print top k predictions and optionally print the index of the predictions in the list
 
@@ -93,9 +123,16 @@ class CLIPLens(object):
         :param top_k: int: Number of top tokens to print
         """
         top_k = min(top_k, len(self.entities))
-        probs = self.probs.clone().squeeze(0).numpy()
+        cls_token_residual_stream = self.cache["resid_post", layer_idx][:, 0, :]
+        pre_proj_cls_token = self.cache.apply_ln_to_stack(
+            cls_token_residual_stream, layer=layer_idx, pos_slice=0
+        )
+        logits = self.get_logits_from_pre_proj_cls(pre_proj_cls_token)
+        probs = logits.softmax(dim=-1).squeeze(0).cpu().detach().numpy()
         sorted_probs = np.sort(probs)[::-1]
         sorted_probs_args = np.argsort(probs)[::-1]
+        output_str = ""
+        data = []
 
         for i in range(top_k):
             index = sorted_probs_args[i]
@@ -109,34 +146,59 @@ class CLIPLens(object):
             logit_str = f"Logit: {logit:.2f}"
             prob_str = f"Prob: {prob * 100:.2f}%"
             token_str = f"Label: |{label}|"
-
-            print(f"{rank_str} {logit_str} {prob_str} {token_str}")
+            output_str += f"{rank_str} {logit_str} {prob_str} {token_str}\n"
+            data.append(
+                {
+                    "Rank": i,
+                    "Logit": logit,
+                    "Prob": prob,
+                    "Label": label,
+                }
+            )
 
         if print_idx:
             for idx in print_idx:
                 entity = self.get_entity(idx)
                 rank = np.where(sorted_probs_args == idx)[0][0]
-                print(f"Class Name: {entity} | Rank: {rank} | Index: {idx}")
+                output_str += f"Class Name: {entity} | Rank: {rank} | Index: {idx}\n"
+                data.append(
+                    {
+                        "Rank": rank,
+                        "Logit": self.logits[0, idx].item(),
+                        "Prob": probs[idx],
+                        "Label": entity,
+                    }
+                )
+        print(output_str)
+        return pd.DataFrame(data)
 
-    def get_W_H(self, token: torch.Tensor) -> torch.Tensor:
-        n = (token @ self.model.head.W_H + self.model.head.b_H).norm(
+    def get_W_H(self, pre_proj_token: torch.Tensor) -> torch.Tensor:
+        n = (pre_proj_token @ self.model.head.W_H + self.model.head.b_H).norm(
             dim=-1, keepdim=True
         )
         scaled_text_features = self.logit_scale * self.text_features.T
         return self.model.head.W_H / n @ scaled_text_features
 
-    def get_b_H(self, token: torch.Tensor) -> torch.Tensor:
-        n = (token @ self.model.head.W_H + self.model.head.b_H).norm(
+    def get_b_H(self, pre_proj_token: torch.Tensor) -> torch.Tensor:
+        n = (pre_proj_token @ self.model.head.W_H + self.model.head.b_H).norm(
             dim=-1, keepdim=True
         )
         scaled_text_features = self.logit_scale * self.text_features.T
         return self.model.head.b_H / n @ scaled_text_features
 
-    def tokens_to_residual_directions(self, indices: np.ndarray, token: torch.Tensor):
-        new_W_H = self.get_W_H(token)
+    def tokens_to_residual_directions(
+        self, indices: np.ndarray, pre_proj_token: torch.Tensor
+    ):
+        """
+        :param indices: np.ndarray: Indices of the tokens to get the residual directions for
+        :param pre_proj_token: torch.Tensor: Pre projection token (after layer norm, before unembed)
+        """
+        new_W_H = self.get_W_H(pre_proj_token)
         return new_W_H.T[indices]
 
-    def residual_stack_to_logit_v2(self, residual_stack: torch.Tensor):
+    def residual_stack_to_logit_v2(
+        self, residual_stack: torch.Tensor, use_last_unembed: bool = True
+    ):
         scaled_residual_stack = self.cache.apply_ln_to_stack(
             residual_stack, layer=-1, pos_slice=0
         )
@@ -154,14 +216,7 @@ class CLIPLens(object):
         accumulated_residual, labels = self.cache.accumulated_resid(
             layer=-1, incl_mid=incl_mid, return_labels=True
         )
-        scaled_residual_stack = self.cache.apply_ln_to_stack(
-            accumulated_residual,
-            layer=-1,
-        )
-        # result = torch.einsum('lbpd,od -> lbpo', scaled_residual_stack, all_answers)
-
-        # Rearrange so batches are first
-        result = self.residual_stack_to_logit_v2(scaled_residual_stack).unsqueeze(0)
+        result = self.residual_stack_to_logit_v2(accumulated_residual).unsqueeze(0)
         result = result.permute(0, 1, 3, 2)
         return result, labels
 
@@ -216,17 +271,33 @@ class CLIPLens(object):
             logit_predictions = logit_predictions.mean(axis=0)
         return logit_predictions
 
-    def display_patch_logit_lens(self):
+    def display_patch_logit_lens(
+        self, no_bias: bool = True, layer_idx: int = -1, token_idx: int = 0
+    ):
         n = len(self.entities)
-        patch_logit_directions_v2 = self.get_patch_logit_directions_v2(
-            np.arange(n), incl_mid=False
-        )
-        patch_dictionary_v2 = self.get_patch_logit_dictionary(
-            patch_logit_directions_v2, batch_idx=0
+        if no_bias:
+            cls_token_residual_stream = self.cache["resid_post", layer_idx][
+                :, token_idx, :
+            ]
+            pre_proj_cls_token = self.cache.apply_ln_to_stack(
+                cls_token_residual_stream, layer=layer_idx, pos_slice=token_idx
+            )
+            all_answers = self.tokens_to_residual_directions(
+                np.arange(n), pre_proj_token=pre_proj_cls_token
+            )
+            patch_logit_directions = get_patch_logit_directions(
+                self.cache, all_answers, incl_mid=False
+            )
+        else:
+            patch_logit_directions = self.get_patch_logit_directions_v2(
+                np.arange(n), incl_mid=False
+            )
+        patch_dictionary = self.get_patch_logit_dictionary(
+            patch_logit_directions, batch_idx=0
         )
         fig1 = display_patch_logit_lens(
-            patch_dictionary_v2,
-            labels=patch_logit_directions_v2[1],
+            patch_dictionary,
+            labels=patch_logit_directions[1],
             entity_to_emoji=self.emoji_mapping,
             width=1300,
             height=1000,
@@ -234,13 +305,30 @@ class CLIPLens(object):
         )
         fig1.show()
 
-    def display_logit_lens(self, layer_idx: int=-1):
+    def display_logit_lens(
+        self, layer_idx: int = -1, proj_layer_idx: int = -1, no_bias: bool = True
+    ):
         n = len(self.entities)
-        patch_logit_directions_v2 = self.get_patch_logit_directions_v2(
-            np.arange(n), incl_mid=False
-        )
+        if no_bias:
+            cls_token_residual_stream = self.cache["resid_post", proj_layer_idx][
+                :, 0, :
+            ]
+            pre_proj_cls_token = self.cache.apply_ln_to_stack(
+                cls_token_residual_stream, layer=proj_layer_idx, pos_slice=0
+            )
+            # pre_proj_cls_token = self.cache["ln_final.hook_normalized"][:, 0, :]
+            all_answers = self.tokens_to_residual_directions(
+                np.arange(n), pre_proj_cls_token
+            )
+            patch_logit_directions = get_patch_logit_directions(
+                self.cache, all_answers, incl_mid=False
+            )
+        else:
+            patch_logit_directions = self.get_patch_logit_directions_v2(
+                np.arange(n), incl_mid=False
+            )
         patch_dictionary_v2 = self.get_patch_logit_dictionary(
-            patch_logit_directions_v2, batch_idx=0
+            patch_logit_directions, batch_idx=0
         )
         fig = display_grid_on_image_with_heatmap(
             self.image_tensor_unnormalized,
@@ -345,25 +433,46 @@ def display_patch_logit_lens(
 
 if __name__ == "__main__":
     clip_lens = CLIPLens()
-    # entities = list(IMAGENET_DICT.values())
-    # emoji_mapping = IMAGENET_EMOJI
-    entities = ["cat","dog", "bird", "fish", "shark"]
-    emoji_mapping = {
-        0: "🐱",
-        1: "🐶",
-        2: "🐦",
-        3: "🐟",
-        4: "🦈",
-    }
-    # randomly permute classes 
+    entities = list(IMAGENET_DICT.values())
+    emoji_mapping = IMAGENET_EMOJI
+    entities.append("")
+    emoji_mapping[len(entities) - 1] = "📷"
+    entities.append("cat and dog")
+    emoji_mapping[len(entities) - 1] = "🐱🐶"
+    # entities.append("cat and dog and mouse")
+    # emoji_mapping[len(entities) - 1] = "🐱🐶🐭"
+    # entities.append("cat and dog and mouse and serghei")
+    # emoji_mapping[len(entities) - 1] = "🐱🐶🐭🧑‍🦱"
+    entities.append("everything")
+    emoji_mapping[len(entities) - 1] = "🌍"
+    entities.append("nothing")
+    emoji_mapping[len(entities) - 1] = "🚫"
+
+    # entities = [" of a cat"," of a dog", " of a bird", " of a fish", " of a great white shark", " of a pig", " of a house", ""]
+    # emoji_mapping = {
+    #     0: "🐱",
+    #     1: "🐶",
+    #     2: "🐦",
+    #     3: "🐟",
+    #     4: "🦈",
+    #     5 : "🐷",
+    #     6: "🏠",
+    #     7: "📷",
+    # }
+    # randomly permute classes
     # entities = np.random.permutation(entities).tolist()
 
     clip_lens.compute_text_cache(
         entities=entities,
-        prompt_template="a photo of a {}",
+        # prompt_template="a photo{}",
         emoji_mapping=emoji_mapping,
     )
+    patch = torch.load("patch.pt")
     image = Image.open("notebooks/cat_dog.jpeg")
-    clip_lens.compute_image_cache(image)
+    clip_lens.compute_image_cache(image, patch=patch)
+    # clip_lens.compute_image_cache(image)
+    clip_lens.print_preds(layer_idx=-1)
+    clip_lens.print_preds(layer_idx=0)
+    clip_lens.display_patch_logit_lens(no_bias=False)
+    # clip_lens.display_logit_lens(layer_idx=-1)
     print("hi")
-        
